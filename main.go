@@ -272,27 +272,27 @@ func (c *Client) handleMessageRegistered(msg *irc.Message) error {
 					Command: irc.ERR_NOSUCHCHANNEL,
 					Params:  []string{c.nick, id, fmt.Sprintf("No such channel (%v)", err)},
 				}
-			} else {
-				c.msgs <- &irc.Message{
-					Prefix:  c.srv.prefix(),
-					Command: "JOIN",
-					Params:  []string{id},
-				}
-				c.msgs <- &irc.Message{
-					Prefix:  c.srv.prefix(),
-					Command: irc.RPL_TOPIC,
-					Params:  []string{c.nick, id, fmt.Sprintf("https://www.youtube.com/watch?v=%s", id)},
-				}
-				c.msgs <- &irc.Message{
-					Prefix:  c.srv.prefix(),
-					Command: irc.RPL_NAMREPLY,
-					Params:  []string{c.nick, "=", id, c.nick},
-				}
-				c.msgs <- &irc.Message{
-					Prefix:  c.srv.prefix(),
-					Command: irc.RPL_ENDOFNAMES,
-					Params:  []string{c.nick, id, "End of /NAMES list"},
-				}
+				break
+			}
+			c.msgs <- &irc.Message{
+				Prefix:  c.srv.prefix(),
+				Command: "JOIN",
+				Params:  []string{id},
+			}
+			c.msgs <- &irc.Message{
+				Prefix:  c.srv.prefix(),
+				Command: irc.RPL_TOPIC,
+				Params:  []string{c.nick, id, fmt.Sprintf("https://www.youtube.com/watch?v=%s", strings.TrimPrefix(id, "#"))},
+			}
+			c.msgs <- &irc.Message{
+				Prefix:  c.srv.prefix(),
+				Command: irc.RPL_NAMREPLY,
+				Params:  []string{c.nick, "=", id, c.nick},
+			}
+			c.msgs <- &irc.Message{
+				Prefix:  c.srv.prefix(),
+				Command: irc.RPL_ENDOFNAMES,
+				Params:  []string{c.nick, id, "End of /NAMES list"},
 			}
 		}
 	case "PART":
@@ -304,12 +304,12 @@ func (c *Client) handleMessageRegistered(msg *irc.Message) error {
 					Command: irc.ERR_NOSUCHCHANNEL,
 					Params:  []string{c.nick, id, fmt.Sprintf("No such channel (%v)", err)},
 				}
-			} else {
-				c.msgs <- &irc.Message{
-					Prefix:  c.srv.prefix(),
-					Command: "PART",
-					Params:  []string{id},
-				}
+				break
+			}
+			c.msgs <- &irc.Message{
+				Prefix:  c.srv.prefix(),
+				Command: "PART",
+				Params:  []string{id},
 			}
 		}
 	case "NAMES":
@@ -433,7 +433,7 @@ func (c *Client) ServeOutgoing() {
 type ytEmoteInfo struct {
 	Id   string `json:"id"`
 	Name string `json:"name"`
-	Url  string `json:"url"`
+	URL  string `json:"url"`
 }
 
 type ytMessagePart struct {
@@ -448,13 +448,29 @@ type ytMessage struct {
 	Messages      []ytMessagePart `json:"message"`
 }
 
+func (m *ytMessage) Process() {
+	for _, msg := range m.Messages {
+		if len(msg.Text) > 0 {
+			continue
+		}
+
+		// Emoji's are their own id and name so we can pick them out fairly
+		// easily. We want to pass them along as text and not encode them in
+		// the `emotes` and `emotes-url` tags.
+		if msg.Emote.Id == msg.Emote.Name {
+			msg.Text = msg.Emote.Name
+			msg.Emote = ytEmoteInfo{}
+		}
+	}
+}
+
 func (m *ytMessage) String() string {
 	ret := ""
 	for _, msg := range m.Messages {
 		if len(msg.Text) > 0 {
 			ret += msg.Text
 		} else {
-			ret += msg.Emote.Name
+			ret += msg.Emote.Name + " "
 		}
 	}
 	return ret
@@ -468,7 +484,7 @@ func (m *ytMessage) EmotesTag() string {
 			pos += len(msg.Text)
 		} else {
 			s := pos
-			e := pos + len(msg.Emote.Name)
+			e := pos + len(msg.Emote.Name+" ")
 			emoPos[msg.Emote.Name] = append(emoPos[msg.Emote.Name], []int32{int32(s), int32(e)})
 		}
 	}
@@ -490,6 +506,29 @@ func (m *ytMessage) EmotesTag() string {
 			} else {
 				tag += fmt.Sprintf(",%d-%d", r[0], r[1])
 			}
+		}
+	}
+	return tag
+}
+
+func (m *ytMessage) EmotesURLTag() string {
+	urls := map[string]string{}
+	for _, msg := range m.Messages {
+		if len(msg.Emote.Name) > 0 {
+			urls[msg.Emote.Name] = msg.Emote.URL
+		}
+	}
+
+	// I hope no one uses ; or = in their url.
+	// k=v [;k=v ...]
+	isFirst := true
+	tag := ""
+	for k, v := range urls {
+		if isFirst {
+			isFirst = false
+			tag += fmt.Sprintf("%s=%s", k, v)
+		} else {
+			tag += fmt.Sprintf(";%s=%s", k, v)
 		}
 	}
 	return tag
@@ -565,10 +604,12 @@ func (c *chat) readChat() error {
 		if err := json.Unmarshal(enc, &ytMsg); err != nil {
 			return fmt.Errorf("Bad YT chat response: %v", err)
 		}
-		log.Printf("Got message: %v", ytMsg.String())
+		ytMsg.Process() // do some filtering: emoji passthrough
+		log.Printf("Got message: %+v", ytMsg)
 		tags := irc.Tags{}
 		tags["time"] = irc.TagValue(formatTimeUsec(ytMsg.TimestampUsec))
 		tags["emotes"] = irc.TagValue(ytMsg.EmotesTag())
+		tags["emotes-url"] = irc.TagValue(ytMsg.EmotesURLTag())
 		c.msgs <- &irc.Message{
 			Prefix:  &irc.Prefix{Name: strings.ReplaceAll(ytMsg.Author, " ", "_")},
 			Command: "PRIVMSG",
