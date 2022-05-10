@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -14,6 +13,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	// "golang.org/x/time/rate"
@@ -90,30 +91,34 @@ func getISupport() []string {
 
 type Client struct {
 	*irc.Conn
+	id         string
 	srv        *Server
-	registered bool
 	caps       capabilities
 	nick       string
 	user       string
+	registered bool
 	capsReg    bool // are we in cap registration? used to wait for CAP END.
 	nickReg    string
 	userReg    string
 	closer     func() error
+	msgs       chan *irc.Message
 }
 
-func newClient(c io.ReadWriteCloser, s *Server) *Client {
+func newClient(c net.Conn, s *Server) *Client {
 	return &Client{
-		Conn:       irc.NewConn(c),
-		srv:        s,
-		registered: false,
-		caps:       capabilities{},
-		nick:       "*",
-		user:       "anonymous",
+		Conn: irc.NewConn(c),
+		id:   c.RemoteAddr().String(),
+		srv:  s,
+		caps: capabilities{},
+		nick: "*",
+		user: "anonymous",
+		msgs: make(chan *irc.Message),
 		// handle registration phase data.
-		capsReg: false,
-		nickReg: "",
-		userReg: "",
-		closer:  c.Close,
+		registered: false,
+		capsReg:    false,
+		nickReg:    "",
+		userReg:    "",
+		closer:     c.Close,
 	}
 }
 
@@ -153,11 +158,11 @@ func (c *Client) handleMessageUnregistered(msg *irc.Message) error {
 			for k, _ := range serverCaps {
 				caps = append(caps, k)
 			}
-			c.SendMessage(&irc.Message{
+			c.msgs <- &irc.Message{
 				Prefix:  c.srv.prefix(),
 				Command: "CAP",
 				Params:  []string{c.nick, "LS", strings.Join(caps, " ")},
-			})
+			}
 			c.capsReg = true
 		case "REQ":
 			capsNames := strings.Fields(msg.Params[1])
@@ -187,11 +192,11 @@ func (c *Client) handleMessageUnregistered(msg *irc.Message) error {
 			if !ack {
 				rep = "NACK"
 			}
-			c.SendMessage(&irc.Message{
+			c.msgs <- &irc.Message{
 				Prefix:  c.srv.prefix(),
 				Command: "CAP",
 				Params:  []string{c.nick, rep, msg.Params[1]},
-			})
+			}
 		case "END":
 			c.capsReg = false
 		default:
@@ -218,8 +223,6 @@ func (c *Client) handleMessageUnregistered(msg *irc.Message) error {
 }
 
 func (c *Client) handleMessageRegistered(msg *irc.Message) error {
-	// https://modern.ircdocs.horse/#connection-registration
-	// Handle initial connection setup and negotiation
 	switch msg.Command {
 	case "CAP":
 		sub := msg.Params[0]
@@ -229,103 +232,99 @@ func (c *Client) handleMessageRegistered(msg *irc.Message) error {
 			for k, _ := range serverCaps {
 				caps = append(caps, k)
 			}
-			c.SendMessage(&irc.Message{
+			c.msgs <- &irc.Message{
 				Prefix:  c.srv.prefix(),
 				Command: "CAP",
 				Params:  []string{c.nick, "LS", strings.Join(caps, " ")},
-			})
+			}
 		case "REQ":
 			// We are dumb, you should have requested during registration.
-			c.SendMessage(&irc.Message{
+			c.msgs <- &irc.Message{
 				Prefix:  c.srv.prefix(),
 				Command: "CAP",
 				Params:  []string{c.nick, "NACK", msg.Params[1]},
-			})
+			}
 		case "END":
 		case "LIST":
 			caps := []string{}
 			for k, _ := range c.caps {
 				caps = append(caps, k)
 			}
-			c.SendMessage(&irc.Message{
+			c.msgs <- &irc.Message{
 				Prefix:  c.srv.prefix(),
 				Command: "CAP",
 				Params:  []string{c.nick, "LIST", strings.Join(caps, " ")},
-			})
+			}
 		default:
 			return fmt.Errorf("Unknown CAP subcommand: %s", sub)
 		}
-	case "NICK":
-		c.nick = msg.Params[0]
-	case "USER":
-		c.user = msg.Params[0]
+	case "NICK", "USER":
 	case "WHO", "WHOIS", "WHOWAS", "MODE":
 
 	// Channel stuff.
 	case "JOIN":
 		chans := strings.Split(msg.Params[0], ",")
 		for _, id := range chans {
-			id = strings.TrimPrefix(id, "#")
 			if err := c.srv.Join(id, c); err != nil {
 				log.Printf("Failed to join: %v", err)
-				c.SendMessage(&irc.Message{
+				c.msgs <- &irc.Message{
 					Prefix:  c.srv.prefix(),
 					Command: irc.ERR_NOSUCHCHANNEL,
 					Params:  []string{c.nick, id, fmt.Sprintf("No such channel (%v)", err)},
-				})
+				}
 			} else {
-				c.SendMessage(&irc.Message{
+				c.msgs <- &irc.Message{
 					Prefix:  c.srv.prefix(),
 					Command: "JOIN",
 					Params:  []string{id},
-				})
-				c.SendMessage(&irc.Message{
+				}
+				c.msgs <- &irc.Message{
 					Prefix:  c.srv.prefix(),
 					Command: irc.RPL_TOPIC,
 					Params:  []string{c.nick, id, fmt.Sprintf("https://www.youtube.com/watch?v=%s", id)},
-				})
-				c.SendMessage(&irc.Message{
+				}
+				c.msgs <- &irc.Message{
 					Prefix:  c.srv.prefix(),
 					Command: irc.RPL_NAMREPLY,
 					Params:  []string{c.nick, "=", id, c.nick},
-				})
-				c.SendMessage(&irc.Message{
+				}
+				c.msgs <- &irc.Message{
 					Prefix:  c.srv.prefix(),
 					Command: irc.RPL_ENDOFNAMES,
 					Params:  []string{c.nick, id, "End of /NAMES list"},
-				})
+				}
 			}
 		}
 	case "PART":
 		chans := strings.Split(msg.Params[0], ",")
 		for _, id := range chans {
-			if err := c.srv.Part(id); err != nil {
-				c.SendMessage(&irc.Message{
+			if err := c.srv.Part(id, c); err != nil {
+				c.msgs <- &irc.Message{
 					Prefix:  c.srv.prefix(),
 					Command: irc.ERR_NOSUCHCHANNEL,
 					Params:  []string{c.nick, id, fmt.Sprintf("No such channel (%v)", err)},
-				})
+				}
 			} else {
-				c.SendMessage(&irc.Message{
+				c.msgs <- &irc.Message{
 					Prefix:  c.srv.prefix(),
 					Command: "PART",
 					Params:  []string{id},
-				})
+				}
 			}
 		}
 	case "NAMES":
 		chans := strings.Split(msg.Params[0], ",")
 		for _, ch := range chans {
-			c.SendMessage(&irc.Message{
+			c.msgs <- &irc.Message{
 				Prefix:  c.srv.prefix(),
 				Command: irc.RPL_NAMREPLY,
 				Params:  []string{c.nick, "=", ch, c.nick},
-			})
-			c.SendMessage(&irc.Message{
+			}
+			c.msgs <- &irc.Message{
 				Prefix:  c.srv.prefix(),
 				Command: irc.RPL_ENDOFNAMES,
 				Params:  []string{c.nick, ch, "End of /NAMES list"},
-			})
+			}
 		}
 	case "LIST":
 		// Maybe do this.
@@ -335,28 +334,28 @@ func (c *Client) handleMessageRegistered(msg *irc.Message) error {
 
 	// Server stuff.
 	case "VERSION":
-		c.SendMessage(&irc.Message{
+		c.msgs <- &irc.Message{
 			Prefix:  c.srv.prefix(),
 			Command: irc.RPL_VERSION,
 			Params:  []string{c.nick, "42", c.srv.host},
-		})
+		}
 		for _, param := range getISupport() {
 			// coalesce into bundles of 13 if we care.
-			c.SendMessage(&irc.Message{
+			c.msgs <- &irc.Message{
 				Prefix:  c.srv.prefix(),
 				Command: irc.RPL_ISUPPORT,
 				Params:  []string{c.nick, param, "are supported by this server"},
-			})
+			}
 		}
 	case "MOTD", "TIME", "INVITE", "STATS", "HELP", "INFO":
 
 	case "PONG":
 	case "PING":
-		c.SendMessage(&irc.Message{
+		c.msgs <- &irc.Message{
 			Prefix:  c.srv.prefix(),
 			Command: "PONG",
 			Params:  []string{msg.Params[0]},
-		})
+		}
 
 	case "QUIT":
 		return fmt.Errorf("Connection closing due to QUIT: nick=%s", c.nick)
@@ -367,15 +366,68 @@ func (c *Client) handleMessageRegistered(msg *irc.Message) error {
 	return nil
 }
 
-// Chat instance mapped to an irc channel.
-type chat struct {
-	id           string
-	version      string
-	continuation string
-	apiKey       string
-	client       *http.Client
-	ircClient    *Client
-	done         chan struct{}
+func (c *Client) Serve() error {
+	for !c.registered {
+		msg, err := c.ReadMessage()
+		if err != nil {
+			return fmt.Errorf("Error reading message during registration: %v", err)
+		}
+		if err := c.handleMessageUnregistered(msg); err != nil {
+			return fmt.Errorf("Error during registration: %v", err)
+		}
+	}
+
+	c.msgs <- &irc.Message{
+		Prefix:  c.srv.prefix(),
+		Command: irc.RPL_WELCOME,
+		Params:  []string{c.nick, "You enter a maze of twisty little passages, all alike."},
+	}
+	c.msgs <- &irc.Message{
+		Prefix:  c.srv.prefix(),
+		Command: irc.RPL_YOURHOST,
+		Params:  []string{c.nick, "Your guide is " + c.srv.host},
+	}
+	c.msgs <- &irc.Message{
+		Prefix:  c.srv.prefix(),
+		Command: irc.RPL_MYINFO,
+		Params:  []string{c.nick, c.srv.host, "irc", "aiwro0", "OovaimnqpsrtklbeI"}, // I know nothing of modes, but soju does this.
+	}
+	for _, param := range getISupport() {
+		// coalesce into bundles of 13 if we care.
+		c.msgs <- &irc.Message{
+			Prefix:  c.srv.prefix(),
+			Command: irc.RPL_ISUPPORT,
+			Params:  []string{c.nick, param, "are supported by this server"},
+		}
+	}
+	c.msgs <- &irc.Message{
+		Prefix:  c.srv.prefix(),
+		Command: irc.RPL_UMODEIS,
+		Params:  []string{c.nick, "+i"},
+	}
+	c.msgs <- &irc.Message{
+		Prefix:  c.srv.prefix(),
+		Command: irc.ERR_NOMOTD,
+		Params:  []string{c.nick, "No MOTD"},
+	}
+
+	for {
+		msg, err := c.ReadMessage()
+		if err != nil {
+			return fmt.Errorf("Error reading message: %v", err)
+		}
+		if err := c.handleMessageRegistered(msg); err != nil {
+			return fmt.Errorf("Error handling message: %v", err)
+		}
+	}
+
+	return nil
+}
+
+func (c *Client) ServeOutgoing() {
+	for m := range c.msgs {
+		c.SendMessage(m)
+	}
 }
 
 type ytEmoteInfo struct {
@@ -443,6 +495,18 @@ func (m *ytMessage) EmotesTag() string {
 	return tag
 }
 
+// Chat instance mapped to an irc channel.
+type chat struct {
+	id           string // Live id used to retrieve chat.
+	version      string // Junk, but lets pretend we are up to date javascript.
+	continuation string // Cursor to server representing what messages have been read so far.
+	apiKey       string
+	client       *http.Client
+	done         chan struct{}
+	msgs         chan *irc.Message
+	s            *Server
+}
+
 var (
 	findInnerAPI     = regexp.MustCompile("\"INNERTUBE_API_KEY\":\"([^\"]*)\"")
 	findContinuation = regexp.MustCompile("\"continuation\":\"([^\"]*)\"")
@@ -482,6 +546,7 @@ func (c *chat) readChat() error {
 		return fmt.Errorf("Bad YT chat response: %v", err)
 	}
 
+	gotMessage := false
 	iter := jsonFilter.Run(idata)
 	for {
 		v, ok := iter.Next()
@@ -491,27 +556,31 @@ func (c *chat) readChat() error {
 		if err, ok := v.(error); ok {
 			return fmt.Errorf("Bad YT chat response: %v", err)
 		}
-		log.Printf("raw jq'ed: %+v", v)
 		// Do something with iter
 		enc, err := json.Marshal(v)
 		if err != nil {
 			return fmt.Errorf("Bad YT chat response: %v", err)
 		}
-		log.Printf("re-encoded: %s", string(enc))
 		ytMsg := ytMessage{}
 		if err := json.Unmarshal(enc, &ytMsg); err != nil {
 			return fmt.Errorf("Bad YT chat response: %v", err)
 		}
-		log.Printf("Got message: %s (raw: %+v)", ytMsg.String(), ytMsg)
+		log.Printf("Got message: %v", ytMsg.String())
 		tags := irc.Tags{}
 		tags["time"] = irc.TagValue(formatTimeUsec(ytMsg.TimestampUsec))
 		tags["emotes"] = irc.TagValue(ytMsg.EmotesTag())
-		c.ircClient.SendMessage(&irc.Message{
+		c.msgs <- &irc.Message{
 			Prefix:  &irc.Prefix{Name: strings.ReplaceAll(ytMsg.Author, " ", "_")},
 			Command: "PRIVMSG",
-			Params:  []string{"#" + c.id, ytMsg.String()},
+			Params:  []string{c.id, ytMsg.String()},
 			Tags:    tags,
-		})
+		}
+		gotMessage = true
+	}
+
+	if gotMessage {
+		c.s.hasWork.Store(true)
+		c.s.hasWorkCond.Signal()
 	}
 
 	return nil
@@ -522,7 +591,8 @@ func (c *chat) Close() {
 	close(c.done)
 }
 
-func joinChat(id string, c *Client) (*chat, error) {
+func NewChat(id string, s *Server) (*chat, error) {
+	id = strings.TrimPrefix(id, "#")
 	client := &http.Client{}
 
 	req, err := http.NewRequest("GET", fmt.Sprintf("https://www.youtube.com/live_chat?is_popout=1&v=%s", id), nil)
@@ -562,13 +632,14 @@ func joinChat(id string, c *Client) (*chat, error) {
 	version := strings.ReplaceAll(versionMatch[1], "\n", "")
 
 	chat := &chat{
-		id:           id,
+		id:           "#" + id,
 		version:      version,
-		ircClient:    c,
 		client:       client,
 		apiKey:       innerAPIKey,
 		continuation: cont,
 		done:         make(chan struct{}),
+		msgs:         make(chan *irc.Message, 256),
+		s:            s,
 	}
 
 	go func() {
@@ -593,11 +664,17 @@ func joinChat(id string, c *Client) (*chat, error) {
 }
 
 type Server struct {
-	host  string
-	chats map[string]*chat
+	host    string
+	clients map[string]*Client
+	members map[string]map[string]*Client
+	chats   map[string]*chat
+	done    chan struct{}
+
+	hasWorkCond *sync.Cond
+	hasWork     atomic.Value // bool
 }
 
-func (s *Server) Serve(l net.Listener) error {
+func (s *Server) ServeClients(l net.Listener) error {
 	for {
 		conn, err := l.Accept()
 		if errors.Is(err, net.ErrClosed) {
@@ -607,99 +684,88 @@ func (s *Server) Serve(l net.Listener) error {
 		}
 
 		go func() {
-			if err := s.handleClient(newClient(conn, s)); err != nil {
+			c := newClient(conn, s)
+			// TODO: Lock
+			s.clients[c.id] = c
+			defer func() {
+				c.Close()
+				delete(s.clients, c.id)
+			}()
+			go c.ServeOutgoing()
+			if err := c.Serve(); err != nil {
 				log.Printf("Client disconnected: %s", err)
 			}
 		}()
 	}
 }
 
+func (s *Server) ServeMessages() {
+	msgs := make([]*irc.Message, 64)
+	for {
+		s.hasWork.Store(false)
+
+		for _, c := range s.chats {
+			msgs = msgs[:0] // clear
+
+		FULL:
+			for {
+				select {
+				case m, ok := <-c.msgs:
+					if !ok {
+						break FULL
+					}
+					msgs = append(msgs, m)
+				default:
+					break FULL
+				}
+			}
+
+			for _, client := range s.members[c.id] {
+				for _, m := range msgs {
+					client.msgs <- m
+				}
+			}
+		}
+
+		if s.hasWork.Load().(bool) {
+			continue
+		}
+		s.hasWorkCond.L.Lock()
+		s.hasWorkCond.Wait()
+		s.hasWorkCond.L.Unlock()
+	}
+}
+
 func (s *Server) Join(id string, client *Client) error {
 	if _, ok := s.chats[id]; ok {
+		s.members[id][client.id] = client
 		return nil
 	}
 
-	c, err := joinChat(id, client)
+	c, err := NewChat(id, s)
 	if err != nil {
 		return err
 	}
 	s.chats[id] = c
+	s.members[id] = map[string]*Client{client.id: client}
 	return nil
 }
 
-func (s *Server) Part(id string) error {
+func (s *Server) Part(id string, client *Client) error {
 	if _, ok := s.chats[id]; !ok {
 		return errors.New("no such channel")
 	}
 
-	s.chats[id].Close()
-	// TODO: Wait on goroutine finishing.
-	delete(s.chats, id)
+	delete(s.members[id], client.id)
+	if len(s.members[id]) == 0 {
+		s.chats[id].Close()
+		delete(s.chats, id)
+	}
 	return nil
 }
 
 func (s *Server) prefix() *irc.Prefix {
 	return &irc.Prefix{Name: s.host}
-}
-
-func (s *Server) handleClient(c *Client) error {
-	defer c.Close()
-	for !c.registered {
-		msg, err := c.ReadMessage()
-		if err != nil {
-			return fmt.Errorf("Error reading message during registration: %v", err)
-		}
-		if err := c.handleMessageUnregistered(msg); err != nil {
-			return fmt.Errorf("Error during registration: %v", err)
-		}
-	}
-	log.Printf("User registered: %s", c.nick)
-
-	c.SendMessage(&irc.Message{
-		Prefix:  s.prefix(),
-		Command: irc.RPL_WELCOME,
-		Params:  []string{c.nick, "You enter a maze of twisty little passages, all alike."},
-	})
-	c.SendMessage(&irc.Message{
-		Prefix:  s.prefix(),
-		Command: irc.RPL_YOURHOST,
-		Params:  []string{c.nick, "Your guide is " + s.host},
-	})
-	c.SendMessage(&irc.Message{
-		Prefix:  s.prefix(),
-		Command: irc.RPL_MYINFO,
-		Params:  []string{c.nick, s.host, "irc", "aiwro0", "OovaimnqpsrtklbeI"}, // I know nothing of modes, but soju does this.
-	})
-	for _, param := range getISupport() {
-		// coalesce into bundles of 13 if we care.
-		c.SendMessage(&irc.Message{
-			Prefix:  s.prefix(),
-			Command: irc.RPL_ISUPPORT,
-			Params:  []string{c.nick, param, "are supported by this server"},
-		})
-	}
-	c.SendMessage(&irc.Message{
-		Prefix:  s.prefix(),
-		Command: irc.RPL_UMODEIS,
-		Params:  []string{c.nick, "+i"},
-	})
-	c.SendMessage(&irc.Message{
-		Prefix:  s.prefix(),
-		Command: irc.ERR_NOMOTD,
-		Params:  []string{c.nick, "No MOTD"},
-	})
-
-	for {
-		msg, err := c.ReadMessage()
-		if err != nil {
-			return fmt.Errorf("Error reading message: %v", err)
-		}
-		if err := c.handleMessageRegistered(msg); err != nil {
-			return fmt.Errorf("Error handling message: %v", err)
-		}
-	}
-
-	return nil
 }
 
 func main() {
@@ -719,8 +785,19 @@ func main() {
 	}
 	ln := tls.NewListener(l, tlsConfig)
 
-	srv := &Server{host: "irc.notyoutube.local", chats: map[string]*chat{}}
-	if err := srv.Serve(ln); err != nil {
+	srv := &Server{
+		host:    "irc.notyoutube.local",
+		clients: map[string]*Client{},
+		chats:   map[string]*chat{},
+		members: map[string]map[string]*Client{},
+
+		hasWorkCond: sync.NewCond(&sync.Mutex{}),
+		hasWork:     atomic.Value{},
+	}
+	srv.hasWork.Store(false)
+
+	go srv.ServeMessages()
+	if err := srv.ServeClients(ln); err != nil {
 		log.Printf("Error serving on %s: %v", ln, err)
 	}
 }
