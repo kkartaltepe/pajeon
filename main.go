@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -123,11 +124,12 @@ func newClient(c net.Conn, s *Server) *Client {
 }
 
 func (c *Client) Close() error {
+	close(c.msgs)
 	return c.closer()
 }
 
 func (c *Client) SendMessage(msg *irc.Message) {
-	if !c.caps.IsEnabled("message-tag") {
+	if !c.caps.IsEnabled("message-tags") {
 		msg = msg.Copy()
 		msg.Tags = irc.Tags{}
 	}
@@ -142,7 +144,7 @@ func (c *Client) SendMessage(msg *irc.Message) {
 		// Set prefix to nil?
 	}
 	if err := c.WriteMessage(msg); err != nil {
-		log.Printf("Failed to send message: %v")
+		log.Printf("Failed to send message: %v", err)
 	}
 }
 
@@ -259,7 +261,7 @@ func (c *Client) handleMessageRegistered(msg *irc.Message) error {
 			return fmt.Errorf("Unknown CAP subcommand: %s", sub)
 		}
 	case "NICK", "USER":
-	case "WHO", "WHOIS", "WHOWAS", "MODE":
+	case "WHO", "WHOIS", "WHOWAS", "MODE", "AWAY":
 
 	// Channel stuff.
 	case "JOIN":
@@ -484,7 +486,8 @@ func (m *ytMessage) EmotesTag() string {
 			pos += len(msg.Text)
 		} else {
 			s := pos
-			e := pos + len(msg.Emote.Name+" ")
+			e := pos + len(msg.Emote.Name) - 1
+			pos += e + 2 // Since we add a space after these in String()
 			emoPos[msg.Emote.Name] = append(emoPos[msg.Emote.Name], []int32{int32(s), int32(e)})
 		}
 	}
@@ -519,16 +522,18 @@ func (m *ytMessage) EmotesURLTag() string {
 		}
 	}
 
-	// I hope no one uses ; or = in their url.
-	// k=v [;k=v ...]
+	// Reuse same separators as `emote`
+	// k:v [/k:v ...]
 	isFirst := true
 	tag := ""
 	for k, v := range urls {
+		v = base64.StdEncoding.EncodeToString([]byte(v))
+		v = strings.ReplaceAll(v, "=", "_")
 		if isFirst {
 			isFirst = false
-			tag += fmt.Sprintf("%s=%s", k, v)
+			tag += fmt.Sprintf("%s:%s", k, v)
 		} else {
-			tag += fmt.Sprintf(";%s=%s", k, v)
+			tag += fmt.Sprintf("/%s:%s", k, v)
 		}
 	}
 	return tag
@@ -630,6 +635,7 @@ func (c *chat) readChat() error {
 func (c *chat) Close() {
 	// TODO: part all chats so they close properly
 	close(c.done)
+	close(c.msgs)
 }
 
 func NewChat(id string, s *Server) (*chat, error) {
@@ -820,11 +826,16 @@ func main() {
 	}
 
 	lc := net.ListenConfig{}
-	l, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:6697")
+	l, err := lc.Listen(context.Background(), "tcp", "127.0.0.2:6697")
 	if err != nil {
 		log.Fatalf("Failed to listen on localhost: %s", err)
 	}
 	ln := tls.NewListener(l, tlsConfig)
+
+	l2, err := net.Listen("tcp", "127.0.0.2:6667")
+	if err != nil {
+		log.Fatalf("Failed to listen on non-tls localhost: %s", err)
+	}
 
 	srv := &Server{
 		host:    "irc.notyoutube.local",
@@ -838,6 +849,12 @@ func main() {
 	srv.hasWork.Store(false)
 
 	go srv.ServeMessages()
+	go func() {
+		if err := srv.ServeClients(l2); err != nil {
+			log.Printf("Error serving on %s: %v", l2, err)
+		}
+	}()
+
 	if err := srv.ServeClients(ln); err != nil {
 		log.Printf("Error serving on %s: %v", ln, err)
 	}
