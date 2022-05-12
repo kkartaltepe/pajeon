@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -51,6 +52,7 @@ func jqMustCompile(s string) *jq.Code {
 type capabilities map[string]bool
 
 func (c capabilities) IsEnabled(cap string) bool {
+	// log.Printf("Checking cap %s in %+v", cap, c)
 	if b, ok := c[cap]; ok {
 		return b
 	}
@@ -111,7 +113,7 @@ func newClient(c net.Conn, s *Server) *Client {
 		id:   c.RemoteAddr().String(),
 		srv:  s,
 		caps: capabilities{},
-		nick: "*",
+		nick: "anonymous",
 		user: "anonymous",
 		msgs: make(chan *irc.Message),
 		// handle registration phase data.
@@ -121,6 +123,10 @@ func newClient(c net.Conn, s *Server) *Client {
 		userReg:    "",
 		closer:     c.Close,
 	}
+}
+
+func (c *Client) prefix() *irc.Prefix {
+	return &irc.Prefix{Name: c.nick, User: c.user, Host: c.id}
 }
 
 func (c *Client) Close() error {
@@ -206,7 +212,13 @@ func (c *Client) handleMessageUnregistered(msg *irc.Message) error {
 		}
 	case "PASS":
 	case "NICK":
+		oldPrefix := c.prefix()
 		c.nickReg = msg.Params[0]
+		c.msgs <- &irc.Message{
+			Prefix:  oldPrefix,
+			Command: "NICK",
+			Params:  []string{c.nick},
+		}
 	case "USER":
 		c.userReg = msg.Params[0]
 
@@ -277,7 +289,7 @@ func (c *Client) handleMessageRegistered(msg *irc.Message) error {
 				break
 			}
 			c.msgs <- &irc.Message{
-				Prefix:  c.srv.prefix(),
+				Prefix:  c.prefix(),
 				Command: "JOIN",
 				Params:  []string{id},
 			}
@@ -300,16 +312,18 @@ func (c *Client) handleMessageRegistered(msg *irc.Message) error {
 	case "PART":
 		chans := strings.Split(msg.Params[0], ",")
 		for _, id := range chans {
-			if err := c.srv.Part(id, c); err != nil {
-				c.msgs <- &irc.Message{
-					Prefix:  c.srv.prefix(),
-					Command: irc.ERR_NOSUCHCHANNEL,
-					Params:  []string{c.nick, id, fmt.Sprintf("No such channel (%v)", err)},
+			/*
+				if err := c.srv.Part(id, c); err != nil {
+					c.msgs <- &irc.Message{
+						Prefix:  c.srv.prefix(),
+						Command: irc.ERR_NOSUCHCHANNEL,
+						Params:  []string{c.nick, id, fmt.Sprintf("No such channel (%v)", err)},
+					}
+					break
 				}
-				break
-			}
+			*/
 			c.msgs <- &irc.Message{
-				Prefix:  c.srv.prefix(),
+				Prefix:  c.prefix(),
 				Command: "PART",
 				Params:  []string{id},
 			}
@@ -374,6 +388,7 @@ func (c *Client) Serve() error {
 		if err != nil {
 			return fmt.Errorf("Error reading message during registration: %v", err)
 		}
+		log.Printf("Pre-Reg message: %+v", msg)
 		if err := c.handleMessageUnregistered(msg); err != nil {
 			return fmt.Errorf("Error during registration: %v", err)
 		}
@@ -415,6 +430,7 @@ func (c *Client) Serve() error {
 
 	for {
 		msg, err := c.ReadMessage()
+		log.Printf("Post-Reg message: %+v", msg)
 		if err != nil {
 			return fmt.Errorf("Error reading message: %v", err)
 		}
@@ -451,7 +467,7 @@ type ytMessage struct {
 }
 
 func (m *ytMessage) Process() {
-	for _, msg := range m.Messages {
+	for i, msg := range m.Messages {
 		if len(msg.Text) > 0 {
 			continue
 		}
@@ -460,8 +476,8 @@ func (m *ytMessage) Process() {
 		// easily. We want to pass them along as text and not encode them in
 		// the `emotes` and `emotes-url` tags.
 		if msg.Emote.Id == msg.Emote.Name {
-			msg.Text = msg.Emote.Name
-			msg.Emote = ytEmoteInfo{}
+			m.Messages[i].Text = msg.Emote.Name
+			m.Messages[i].Emote = ytEmoteInfo{}
 		}
 	}
 }
@@ -486,8 +502,8 @@ func (m *ytMessage) EmotesTag() string {
 			pos += len(msg.Text)
 		} else {
 			s := pos
-			e := pos + len(msg.Emote.Name) - 1
-			pos += e + 2 // Since we add a space after these in String()
+			e := pos + len(msg.Emote.Name) - 1 // Lets match twitch which uses inclusive end unfortunately.
+			pos = e + 1 + 1                    // Because we add a space to String()
 			emoPos[msg.Emote.Name] = append(emoPos[msg.Emote.Name], []int32{int32(s), int32(e)})
 		}
 	}
@@ -555,9 +571,61 @@ var (
 	findInnerAPI     = regexp.MustCompile("\"INNERTUBE_API_KEY\":\"([^\"]*)\"")
 	findContinuation = regexp.MustCompile("\"continuation\":\"([^\"]*)\"")
 	findVersion      = regexp.MustCompile("\"clientVersion\":\"([^\"]*)\"")
+	findFirstContext = regexp.MustCompile("{\"responseContext\"")
 	// Bless jq
-	jsonFilter = jqMustCompile(".. | select(.liveChatTextMessageRenderer? != null).liveChatTextMessageRenderer | {author: .authorName.simpleText, id, timestampUsec, message: [.message.runs[] | {emoji: {id: .emoji.emojiId, name: .emoji.image.accessibility.accessibilityData.label, url: .emoji.image.thumbnails[0].url}, text: .text} ]}")
+	jsonFilter = jqMustCompile(`.. |
+	select(.liveChatTextMessageRenderer? != null).liveChatTextMessageRenderer |
+	{author: .authorName.simpleText, id, timestampUsec, message: [
+	    .message.runs[] |
+	    {
+	        emoji: {id: .emoji.emojiId, name: .emoji.image.accessibility.accessibilityData.label, url: .emoji.image.thumbnails[0].url},
+	        text: .text,
+	    }
+	]}`)
 )
+
+func (c *chat) extractAndSend(data map[string]interface{}) error {
+	gotMessage := false
+	defer func() {
+		if gotMessage {
+			c.s.hasWork.Store(true)
+			c.s.hasWorkCond.Signal()
+		}
+	}()
+
+	iter := jsonFilter.Run(data)
+	for {
+		v, ok := iter.Next()
+		if !ok {
+			break
+		}
+		if err, ok := v.(error); ok {
+			return fmt.Errorf("Bad YT chat response: %v", err)
+		}
+		// Do something with iter
+		enc, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Errorf("Bad YT chat response: %v", err)
+		}
+		ytMsg := ytMessage{}
+		if err := json.Unmarshal(enc, &ytMsg); err != nil {
+			return fmt.Errorf("Bad YT chat response: %v", err)
+		}
+		ytMsg.Process() // do some filtering: emoji passthrough
+		tags := irc.Tags{}
+		tags["time"] = irc.TagValue(formatTimeUsec(ytMsg.TimestampUsec))
+		tags["emotes"] = irc.TagValue(ytMsg.EmotesTag())
+		tags["emotes-url"] = irc.TagValue(ytMsg.EmotesURLTag())
+		c.msgs <- &irc.Message{
+			Prefix:  &irc.Prefix{Name: strings.ReplaceAll(strings.ReplaceAll(ytMsg.Author, " ", "_"), "!", "！")},
+			Command: "PRIVMSG",
+			Params:  []string{c.id, ytMsg.String()},
+			Tags:    tags,
+		}
+		gotMessage = true
+	}
+	return nil
+}
 
 func (c *chat) readChat() error {
 	getLiveChatBody := fmt.Sprintf(`{"context": {"client":{"hl":"en","gl":"US","clientName":"WEB","clientVersion":"%s","platform":"DESKTOP"}},"continuation": "%s"}`, c.version, c.continuation)
@@ -590,45 +658,7 @@ func (c *chat) readChat() error {
 		return fmt.Errorf("Bad YT chat response: %v", err)
 	}
 
-	gotMessage := false
-	iter := jsonFilter.Run(idata)
-	for {
-		v, ok := iter.Next()
-		if !ok {
-			break
-		}
-		if err, ok := v.(error); ok {
-			return fmt.Errorf("Bad YT chat response: %v", err)
-		}
-		// Do something with iter
-		enc, err := json.Marshal(v)
-		if err != nil {
-			return fmt.Errorf("Bad YT chat response: %v", err)
-		}
-		ytMsg := ytMessage{}
-		if err := json.Unmarshal(enc, &ytMsg); err != nil {
-			return fmt.Errorf("Bad YT chat response: %v", err)
-		}
-		ytMsg.Process() // do some filtering: emoji passthrough
-		log.Printf("Got message: %+v", ytMsg)
-		tags := irc.Tags{}
-		tags["time"] = irc.TagValue(formatTimeUsec(ytMsg.TimestampUsec))
-		tags["emotes"] = irc.TagValue(ytMsg.EmotesTag())
-		tags["emotes-url"] = irc.TagValue(ytMsg.EmotesURLTag())
-		c.msgs <- &irc.Message{
-			Prefix:  &irc.Prefix{Name: strings.ReplaceAll(ytMsg.Author, " ", "_")},
-			Command: "PRIVMSG",
-			Params:  []string{c.id, ytMsg.String()},
-			Tags:    tags,
-		}
-		gotMessage = true
-	}
-
-	if gotMessage {
-		c.s.hasWork.Store(true)
-		c.s.hasWorkCond.Signal()
-	}
-
+	c.extractAndSend(idata)
 	return nil
 }
 
@@ -689,6 +719,19 @@ func NewChat(id string, s *Server) (*chat, error) {
 		s:            s,
 	}
 
+	firstCtx := findFirstContext.FindIndex(body)
+	if len(firstCtx) < 1 {
+		return nil, fmt.Errorf("Couldnt find initial chat context")
+	}
+	firstCtxData := map[string]interface{}{}
+	if err := json.NewDecoder(bytes.NewBuffer(body[firstCtx[0]:])).Decode(&firstCtxData); err != nil {
+		return nil, fmt.Errorf("Couldnt decode initial chat context json")
+	}
+	if err := chat.extractAndSend(firstCtxData); err != nil {
+		chat.Close()
+		return nil, fmt.Errorf("Chat closed due to an error: %v", err)
+	}
+
 	go func() {
 		tick := time.NewTicker(ChatPollDuration)
 		defer tick.Stop()
@@ -724,6 +767,7 @@ type Server struct {
 func (s *Server) ServeClients(l net.Listener) error {
 	for {
 		conn, err := l.Accept()
+		log.Printf("Got connection: %s", conn.RemoteAddr().String())
 		if errors.Is(err, net.ErrClosed) {
 			return nil
 		} else if err != nil {
@@ -789,12 +833,13 @@ func (s *Server) Join(id string, client *Client) error {
 		return nil
 	}
 
+	// so we can send initial messages in NewChat
+	s.members[id] = map[string]*Client{client.id: client}
 	c, err := NewChat(id, s)
 	if err != nil {
 		return err
 	}
 	s.chats[id] = c
-	s.members[id] = map[string]*Client{client.id: client}
 	return nil
 }
 
