@@ -280,13 +280,18 @@ func (c *Client) handleMessageRegistered(msg *irc.Message) error {
 		chans := strings.Split(msg.Params[0], ",")
 		for _, id := range chans {
 			if err := c.srv.Join(id, c); err != nil {
-				log.Printf("Failed to join: %v", err)
+				log.Printf("Failed to join: %s %v", id, err)
 				c.msgs <- &irc.Message{
 					Prefix:  c.srv.prefix(),
 					Command: irc.ERR_NOSUCHCHANNEL,
 					Params:  []string{c.nick, id, fmt.Sprintf("No such channel (%v)", err)},
 				}
-				break
+				c.msgs <- &irc.Message{
+					Prefix:  c.prefix(),
+					Command: "PART",
+					Params:  []string{id},
+				}
+				continue
 			}
 			c.msgs <- &irc.Message{
 				Prefix:  c.prefix(),
@@ -308,6 +313,7 @@ func (c *Client) handleMessageRegistered(msg *irc.Message) error {
 				Command: irc.RPL_ENDOFNAMES,
 				Params:  []string{c.nick, id, "End of /NAMES list"},
 			}
+			log.Printf("JOIN success: %s %s", c.nick, id)
 		}
 	case "PART":
 		chans := strings.Split(msg.Params[0], ",")
@@ -564,6 +570,7 @@ type chat struct {
 	client       *http.Client
 	done         chan struct{}
 	msgs         chan *irc.Message
+	lock         *sync.Mutex
 	s            *Server
 }
 
@@ -573,15 +580,18 @@ var (
 	findVersion      = regexp.MustCompile("\"clientVersion\":\"([^\"]*)\"")
 	findFirstContext = regexp.MustCompile("{\"responseContext\"")
 	// Bless jq
-	jsonFilter = jqMustCompile(`.. |
-	select(.liveChatTextMessageRenderer? != null).liveChatTextMessageRenderer |
-	{author: .authorName.simpleText, id, timestampUsec, message: [
-	    .message.runs[] |
-	    {
+	jsonFilter = jqMustCompile(`.. | select(type == "object") |
+	if has("liveChatPaidMessageRenderer") then .liveChatPaidMessageRenderer
+	elif has("liveChatTextMessageRenderer") then .liveChatTextMessageRenderer
+	else null end
+	| select ( . != null) |
+	{
+	    author: .authorName.simpleText, id, timestampUsec, amount,
+	    message: [ .message.runs[] | {
 	        emoji: {id: .emoji.emojiId, name: .emoji.image.accessibility.accessibilityData.label, url: .emoji.image.thumbnails[0].url},
 	        text: .text,
-	    }
-	]}`)
+	    }]
+	}`)
 )
 
 func (c *chat) extractAndSend(data map[string]interface{}) error {
@@ -593,6 +603,7 @@ func (c *chat) extractAndSend(data map[string]interface{}) error {
 		}
 	}()
 
+	toSend := make([]*irc.Message, 0, 64)
 	iter := jsonFilter.Run(data)
 	for {
 		v, ok := iter.Next()
@@ -616,14 +627,25 @@ func (c *chat) extractAndSend(data map[string]interface{}) error {
 		tags["time"] = irc.TagValue(formatTimeUsec(ytMsg.TimestampUsec))
 		tags["emotes"] = irc.TagValue(ytMsg.EmotesTag())
 		tags["emotes-url"] = irc.TagValue(ytMsg.EmotesURLTag())
-		c.msgs <- &irc.Message{
+		toSend = append(toSend, &irc.Message{
 			Prefix:  &irc.Prefix{Name: strings.ReplaceAll(strings.ReplaceAll(ytMsg.Author, " ", "_"), "!", "！")},
 			Command: "PRIVMSG",
 			Params:  []string{c.id, ytMsg.String()},
 			Tags:    tags,
-		}
-		gotMessage = true
+		})
 	}
+
+	c.lock.Lock()
+	select {
+	case <-c.done:
+		return nil
+	default:
+		for _, m := range toSend {
+			gotMessage = true
+			c.msgs <- m
+		}
+	}
+	c.lock.Unlock()
 	return nil
 }
 
@@ -664,8 +686,10 @@ func (c *chat) readChat() error {
 
 func (c *chat) Close() {
 	// TODO: part all chats so they close properly
+	c.lock.Lock()
 	close(c.done)
 	close(c.msgs)
+	c.lock.Unlock()
 }
 
 func NewChat(id string, s *Server) (*chat, error) {
@@ -716,6 +740,7 @@ func NewChat(id string, s *Server) (*chat, error) {
 		continuation: cont,
 		done:         make(chan struct{}),
 		msgs:         make(chan *irc.Message, 256),
+		lock:         &sync.Mutex{},
 		s:            s,
 	}
 
@@ -738,6 +763,7 @@ func NewChat(id string, s *Server) (*chat, error) {
 		for {
 			select {
 			case <-chat.done:
+				log.Printf("Closing %s reader", chat.id)
 				return
 			case <-tick.C:
 				if err := chat.readChat(); err != nil {
