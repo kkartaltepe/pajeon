@@ -1,4 +1,4 @@
-module yt-irc
+module pajeon
 
 go 1.18
 

@@ -318,16 +318,13 @@ func (c *Client) handleMessageRegistered(msg *irc.Message) error {
 	case "PART":
 		chans := strings.Split(msg.Params[0], ",")
 		for _, id := range chans {
-			/*
-				if err := c.srv.Part(id, c); err != nil {
-					c.msgs <- &irc.Message{
-						Prefix:  c.srv.prefix(),
-						Command: irc.ERR_NOSUCHCHANNEL,
-						Params:  []string{c.nick, id, fmt.Sprintf("No such channel (%v)", err)},
-					}
-					break
+			if err := c.srv.Part(id, c); err != nil {
+				c.msgs <- &irc.Message{
+					Prefix:  c.srv.prefix(),
+					Command: irc.ERR_NOSUCHCHANNEL,
+					Params:  []string{c.nick, id, fmt.Sprintf("No such channel (%v)", err)},
 				}
-			*/
+			}
 			c.msgs <- &irc.Message{
 				Prefix:  c.prefix(),
 				Command: "PART",
@@ -468,11 +465,16 @@ type ytMessagePart struct {
 type ytMessage struct {
 	Author        string          `json:"author"`
 	Id            string          `json:"id"`
+	Amount        string          `json:"amount"`
+	Badges        []string        `json:"badges"`
 	TimestampUsec string          `json:"timestampUsec"`
 	Messages      []ytMessagePart `json:"message"`
 }
 
 func (m *ytMessage) Process() {
+	for i, b := range m.Badges {
+		m.Badges[i] = strings.ToLower(strings.Split(b, " ")[0])
+	}
 	for i, msg := range m.Messages {
 		if len(msg.Text) > 0 {
 			continue
@@ -500,16 +502,29 @@ func (m *ytMessage) String() string {
 	return ret
 }
 
+func utf16Len(s string) int {
+	l := 0
+	for _, r := range s {
+		if r <= 0xFFFF {
+			l += 1
+		} else {
+			l += 2
+		}
+	}
+	return l
+}
+
+// Emote lengths are in utf16 encoding because the web is fucking terrible, and we want to match twitch.tv/tags for now.
 func (m *ytMessage) EmotesTag() string {
 	pos := 0
 	emoPos := map[string][][]int32{}
 	for _, msg := range m.Messages {
 		if len(msg.Text) > 0 {
-			pos += len(msg.Text)
+			pos += utf16Len(msg.Text)
 		} else {
 			s := pos
-			e := pos + len(msg.Emote.Name) - 1 // Lets match twitch which uses inclusive end unfortunately.
-			pos = e + 1 + 1                    // Because we add a space to String()
+			e := pos + utf16Len(msg.Emote.Name) - 1 // Lets match twitch which uses inclusive end unfortunately.
+			pos = e + 1 + 1                         // Because we add a space to String()
 			emoPos[msg.Emote.Name] = append(emoPos[msg.Emote.Name], []int32{int32(s), int32(e)})
 		}
 	}
@@ -586,7 +601,9 @@ var (
 	else null end
 	| select ( . != null) |
 	{
-	    author: .authorName.simpleText, id, timestampUsec, amount,
+	    author: .authorName.simpleText, id, timestampUsec,
+	    badges:  (if (.authorBadges | length > 0) then [.authorBadges[] | .liveChatAuthorBadgeRenderer.accessibility.accessibilityData.label] else null end),
+	    amount: .purchaseAmountText.simpleText,
 	    message: [ .message.runs[] | {
 	        emoji: {id: .emoji.emojiId, name: .emoji.image.accessibility.accessibilityData.label, url: .emoji.image.thumbnails[0].url},
 	        text: .text,
@@ -622,11 +639,18 @@ func (c *chat) extractAndSend(data map[string]interface{}) error {
 		if err := json.Unmarshal(enc, &ytMsg); err != nil {
 			return fmt.Errorf("Bad YT chat response: %v", err)
 		}
-		ytMsg.Process() // do some filtering: emoji passthrough
+		ytMsg.Process() // do some filtering: emoji passthrough, badge normalization
 		tags := irc.Tags{}
 		tags["time"] = irc.TagValue(formatTimeUsec(ytMsg.TimestampUsec))
 		tags["emotes"] = irc.TagValue(ytMsg.EmotesTag())
 		tags["emotes-url"] = irc.TagValue(ytMsg.EmotesURLTag())
+		if len(ytMsg.Amount) > 0 {
+			tags["amount"] = irc.TagValue(ytMsg.Amount)
+		}
+		if len(ytMsg.Badges) > 0 {
+			// badge/value,badge/value
+			tags["badges"] = irc.TagValue(strings.Join(ytMsg.Badges, ","))
+		}
 		toSend = append(toSend, &irc.Message{
 			Prefix:  &irc.Prefix{Name: strings.ReplaceAll(strings.ReplaceAll(ytMsg.Author, " ", "_"), "!", "！")},
 			Command: "PRIVMSG",
