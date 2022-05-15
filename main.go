@@ -604,7 +604,7 @@ var (
 	    author: .authorName.simpleText, id, timestampUsec,
 	    badges:  (if (.authorBadges | length > 0) then [.authorBadges[] | .liveChatAuthorBadgeRenderer.accessibility.accessibilityData.label] else null end),
 	    amount: .purchaseAmountText.simpleText,
-	    message: [ .message.runs[] | {
+	    message: [ (if (.message.runs | length > 0) then .message.runs[] else null end) | {
 	        emoji: {id: .emoji.emojiId, name: .emoji.image.accessibility.accessibilityData.label, url: .emoji.image.thumbnails[0].url},
 	        text: .text,
 	    }]
