@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -465,10 +464,12 @@ type ytMessagePart struct {
 type ytMessage struct {
 	Author        string          `json:"author"`
 	Id            string          `json:"id"`
+	Type          string          `json:"type"`
 	Amount        string          `json:"amount"`
 	Badges        []string        `json:"badges"`
 	TimestampUsec string          `json:"timestampUsec"`
 	Messages      []ytMessagePart `json:"message"`
+	SubHeader     []ytMessagePart `json:"headerSubtext"` // make a better name
 }
 
 func (m *ytMessage) Process() {
@@ -502,6 +503,18 @@ func (m *ytMessage) String() string {
 	return ret
 }
 
+func (m *ytMessage) SubHeadString() string {
+	ret := ""
+	for _, msg := range m.SubHeader {
+		if len(msg.Text) > 0 {
+			ret += msg.Text
+		} else {
+			ret += msg.Emote.Name + " "
+		}
+	}
+	return ret
+}
+
 func utf16Len(s string) int {
 	l := 0
 	for _, r := range s {
@@ -521,7 +534,7 @@ func (m *ytMessage) EmotesTag() string {
 	for _, msg := range m.Messages {
 		if len(msg.Text) > 0 {
 			pos += utf16Len(msg.Text)
-		} else {
+		} else if msg.Emote.Id != "" { // TODO: Why are there empty messages when no message field is in the json
 			s := pos
 			e := pos + utf16Len(msg.Emote.Name) - 1 // Lets match twitch which uses inclusive end unfortunately.
 			pos = e + 1 + 1                         // Because we add a space to String()
@@ -594,17 +607,22 @@ var (
 	findContinuation = regexp.MustCompile("\"continuation\":\"([^\"]*)\"")
 	findVersion      = regexp.MustCompile("\"clientVersion\":\"([^\"]*)\"")
 	findFirstContext = regexp.MustCompile("{\"responseContext\"")
-	// Bless jq
+	// Bless, and curse jq
 	jsonFilter = jqMustCompile(`.. | select(type == "object") |
-	if has("liveChatPaidMessageRenderer") then .liveChatPaidMessageRenderer
-	elif has("liveChatTextMessageRenderer") then .liveChatTextMessageRenderer
+	if has("liveChatPaidMessageRenderer") then .liveChatPaidMessageRenderer + {type: "super"}
+	elif has("liveChatTextMessageRenderer") then .liveChatTextMessageRenderer + {type: "chat"}
+	elif has("liveChatMembershipItemRenderer") then .liveChatMembershipItemRenderer + {type: "member"}
 	else null end
 	| select ( . != null) |
 	{
-	    author: .authorName.simpleText, id, timestampUsec,
+	    author: .authorName.simpleText, id, timestampUsec, type,
 	    badges:  (if (.authorBadges | length > 0) then [.authorBadges[] | .liveChatAuthorBadgeRenderer.accessibility.accessibilityData.label] else null end),
 	    amount: .purchaseAmountText.simpleText,
-	    message: [ (if (.message.runs | length > 0) then .message.runs[] else null end) | {
+	    message: [ (if (.message.runs | length > 0) then .message.runs[]  else .message.simpleText end) | {
+	        emoji: {id: .emoji.emojiId, name: .emoji.image.accessibility.accessibilityData.label, url: .emoji.image.thumbnails[0].url},
+	        text: .text,
+	    }],
+	    headerSubtext: [ (if (.headerSubtext.runs | length > 0) then .headerSubtext.runs[] else .headerSubtext.simpleText end) | {
 	        emoji: {id: .emoji.emojiId, name: .emoji.image.accessibility.accessibilityData.label, url: .emoji.image.thumbnails[0].url},
 	        text: .text,
 	    }]
@@ -651,10 +669,20 @@ func (c *chat) extractAndSend(data map[string]interface{}) error {
 			// badge/value,badge/value
 			tags["badges"] = irc.TagValue(strings.Join(ytMsg.Badges, ","))
 		}
+
+		ircCmd := "PRIVMSG"
+		ircAuthor := strings.ReplaceAll(strings.ReplaceAll(ytMsg.Author, " ", "_"), "!", "！")
+		ircMsg := ytMsg.String()
+		if ytMsg.Type == "member" {
+			ircMsg = ircAuthor + " - " + ytMsg.SubHeadString() + ircMsg
+			ircAuthor = "services"
+			ircCmd = "NOTICE"
+		}
+
 		toSend = append(toSend, &irc.Message{
-			Prefix:  &irc.Prefix{Name: strings.ReplaceAll(strings.ReplaceAll(ytMsg.Author, " ", "_"), "!", "！")},
-			Command: "PRIVMSG",
-			Params:  []string{c.id, ytMsg.String()},
+			Prefix:  &irc.Prefix{Name: ircAuthor},
+			Command: ircCmd,
+			Params:  []string{c.id, ircMsg},
 			Tags:    tags,
 		})
 	}
@@ -709,7 +737,6 @@ func (c *chat) readChat() error {
 }
 
 func (c *chat) Close() {
-	// TODO: part all chats so they close properly
 	c.lock.Lock()
 	close(c.done)
 	close(c.msgs)
@@ -739,7 +766,6 @@ func NewChat(id string, s *Server) (*chat, error) {
 
 	apiMatch := findInnerAPI.FindStringSubmatch(string(body))
 	if len(apiMatch) < 2 {
-		log.Printf("body: %s", string(body))
 		return nil, fmt.Errorf("Couldnt find inner API key")
 	}
 	innerAPIKey := strings.ReplaceAll(apiMatch[1], "\n", "")
@@ -768,15 +794,8 @@ func NewChat(id string, s *Server) (*chat, error) {
 		s:            s,
 	}
 
-	firstCtx := findFirstContext.FindIndex(body)
-	if len(firstCtx) < 1 {
-		return nil, fmt.Errorf("Couldnt find initial chat context")
-	}
-	firstCtxData := map[string]interface{}{}
-	if err := json.NewDecoder(bytes.NewBuffer(body[firstCtx[0]:])).Decode(&firstCtxData); err != nil {
-		return nil, fmt.Errorf("Couldnt decode initial chat context json")
-	}
-	if err := chat.extractAndSend(firstCtxData); err != nil {
+	// Read the history and send it down.
+	if err := chat.readChat(); err != nil {
 		chat.Close()
 		return nil, fmt.Errorf("Chat closed due to an error: %v", err)
 	}
@@ -791,7 +810,9 @@ func NewChat(id string, s *Server) (*chat, error) {
 				return
 			case <-tick.C:
 				if err := chat.readChat(); err != nil {
-					chat.Close()
+					s.commands <- &Cmd{kind: "CLOSECHAN", params: []string{chat.id}}
+					s.hasWork.Store(true)
+					s.hasWorkCond.Signal()
 					log.Printf("Chat closed due to error: %v", err)
 					return
 				}
@@ -799,16 +820,22 @@ func NewChat(id string, s *Server) (*chat, error) {
 		}
 	}()
 
-	//TODO: Check that chat is still live here to prevent joins.
 	return chat, nil
 }
 
+// Simple commands for internal work to be serialized.
+type Cmd struct {
+	kind   string
+	params []string
+}
+
 type Server struct {
-	host    string
-	clients map[string]*Client
-	members map[string]map[string]*Client
-	chats   map[string]*chat
-	done    chan struct{}
+	host     string
+	clients  map[string]*Client
+	members  map[string]map[string]*Client
+	chats    map[string]*chat
+	done     chan struct{}
+	commands chan *Cmd
 
 	hasWorkCond *sync.Cond
 	hasWork     atomic.Value // bool
@@ -840,6 +867,16 @@ func (s *Server) ServeClients(l net.Listener) error {
 	}
 }
 
+func (s *Server) HandleCommand(cmd *Cmd) {
+	switch cmd.kind {
+	case "CLOSECHAN":
+		id := cmd.params[0]
+		s.CloseChannel(id)
+	default:
+		log.Printf("Unknown internal cmd: %v", cmd)
+	}
+}
+
 func (s *Server) ServeMessages() {
 	msgs := make([]*irc.Message, 64)
 	for {
@@ -865,6 +902,20 @@ func (s *Server) ServeMessages() {
 				for _, m := range msgs {
 					client.msgs <- m
 				}
+			}
+		}
+
+		// Handle internal work.
+	DONE:
+		for {
+			select {
+			case m, ok := <-s.commands:
+				if !ok {
+					break DONE
+				}
+				s.HandleCommand(m)
+			default:
+				break DONE
 			}
 		}
 
@@ -906,6 +957,26 @@ func (s *Server) Part(id string, client *Client) error {
 	return nil
 }
 
+func (s *Server) CloseChannel(id string) error {
+	if _, ok := s.chats[id]; !ok {
+		return errors.New("no such channel")
+	}
+	s.chats[id].Close()
+
+	for _, c := range s.members[id] {
+		c.msgs <- &irc.Message{
+			Prefix:  c.prefix(),
+			Command: "PART",
+			Params:  []string{id},
+		}
+	}
+
+	delete(s.chats, id)
+	delete(s.members, id)
+
+	return nil
+}
+
 func (s *Server) prefix() *irc.Prefix {
 	return &irc.Prefix{Name: s.host}
 }
@@ -933,10 +1004,11 @@ func main() {
 	}
 
 	srv := &Server{
-		host:    "irc.notyoutube.local",
-		clients: map[string]*Client{},
-		chats:   map[string]*chat{},
-		members: map[string]map[string]*Client{},
+		host:     "irc.notyoutube.local",
+		clients:  map[string]*Client{},
+		chats:    map[string]*chat{},
+		members:  map[string]map[string]*Client{},
+		commands: make(chan *Cmd, 16),
 
 		hasWorkCond: sync.NewCond(&sync.Mutex{}),
 		hasWork:     atomic.Value{},
