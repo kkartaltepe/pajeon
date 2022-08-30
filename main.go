@@ -326,18 +326,10 @@ func (c *Client) handleMessageRegistered(msg *irc.Message) error {
 	case "PART":
 		chans := strings.Split(msg.Params[0], ",")
 		for _, id := range chans {
-			if err := c.srv.Part(id, c); err != nil {
-				c.msgs <- &irc.Message{
-					Prefix:  c.srv.prefix(),
-					Command: irc.ERR_NOSUCHCHANNEL,
-					Params:  []string{c.nick, id, fmt.Sprintf("No such channel (%v)", err)},
-				}
-			}
-			c.msgs <- &irc.Message{
-				Prefix:  c.prefix(),
-				Command: "PART",
-				Params:  []string{id},
-			}
+			c.srv.commands <- &Cmd{kind: "INTERNAL_PART", params: []string{c.id, id}}
+			// TODO: let this buffer longer but gamja cant handle us buffering parts right now.
+			c.srv.hasWork.Store(true)
+			c.srv.hasWorkCond.Signal()
 		}
 	case "NAMES":
 		chans := strings.Split(msg.Params[0], ",")
@@ -902,6 +894,25 @@ func (s *Server) HandleCommand(cmd *Cmd) {
 	case "CLOSECHAN":
 		id := cmd.params[0]
 		s.CloseChannel(id)
+	case "INTERNAL_PART":
+		c, ok := s.clients[cmd.params[0]]
+		if !ok { log.Print("Parting but no such client"); return }
+		channel, ok := s.chats[cmd.params[1]]
+		if !ok { log.Print("Parting but no such channel"); return }
+
+		if err := s.Part(channel.id, c); err != nil {
+			c.msgs <- &irc.Message{
+				Prefix:  s.prefix(),
+				Command: irc.ERR_NOSUCHCHANNEL,
+				Params:  []string{c.nick, channel.id, fmt.Sprintf("No such channel (%v)", err)},
+			}
+		}
+
+		c.msgs <- &irc.Message{
+			Prefix:  c.prefix(),
+			Command: "PART",
+			Params:  []string{channel.id},
+		}
 	default:
 		log.Printf("Unknown internal cmd: %v", cmd)
 	}
@@ -981,8 +992,7 @@ func (s *Server) Part(id string, client *Client) error {
 
 	delete(s.members[id], client.id)
 	if len(s.members[id]) == 0 {
-		s.chats[id].Close()
-		delete(s.chats, id)
+		s.CloseChannel(id)
 	}
 	return nil
 }
