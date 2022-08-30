@@ -26,6 +26,15 @@ import (
 const ChatPollDuration = 2 * time.Second
 const ircTimeLayout = "2006-01-02T15:04:05.000Z"
 
+func coalesce(ss ...string) string {
+    for _, s := range ss {
+        if s != "" {
+            return s
+        }
+    }
+    return ""
+}
+
 func formatTimeUsec(t string) string {
 	intVal, err := strconv.ParseInt(t, 0, 64)
 	if err != nil {
@@ -470,13 +479,20 @@ type ytMessage struct {
 	TimestampUsec string          `json:"timestampUsec"`
 	Messages      []ytMessagePart `json:"message"`
 	SubHeader     []ytMessagePart `json:"headerSubtext"` // make a better name
+	PrimaryText   []ytMessagePart `json:"primaryText"`   // make a better name
 }
 
 func (m *ytMessage) Process() {
 	for i, b := range m.Badges {
 		m.Badges[i] = strings.ToLower(strings.Split(b, " ")[0])
 	}
-	for i, msg := range m.Messages {
+	runProcess(m.Messages)
+	runProcess(m.SubHeader)
+	runProcess(m.PrimaryText)
+}
+
+func runProcess(r []ytMessagePart) {
+	for i, msg := range r {
 		if len(msg.Text) > 0 {
 			continue
 		}
@@ -485,30 +501,18 @@ func (m *ytMessage) Process() {
 		// easily. We want to pass them along as text and not encode them in
 		// the `emotes` and `emotes-url` tags.
 		if msg.Emote.Id == msg.Emote.Name {
-			m.Messages[i].Text = msg.Emote.Name
-			m.Messages[i].Emote = ytEmoteInfo{}
+			r[i].Text = msg.Emote.Name
+			r[i].Emote = ytEmoteInfo{}
 		}
 	}
 }
 
-func (m *ytMessage) String() string {
+func runToString(r []ytMessagePart) string {
 	ret := ""
-	for _, msg := range m.Messages {
+	for _, msg := range r {
 		if len(msg.Text) > 0 {
 			ret += msg.Text
-		} else {
-			ret += msg.Emote.Name + " "
-		}
-	}
-	return ret
-}
-
-func (m *ytMessage) SubHeadString() string {
-	ret := ""
-	for _, msg := range m.SubHeader {
-		if len(msg.Text) > 0 {
-			ret += msg.Text
-		} else {
+		} else if len(msg.Emote.Name) > 0 {
 			ret += msg.Emote.Name + " "
 		}
 	}
@@ -608,24 +612,28 @@ var (
 	findVersion      = regexp.MustCompile("\"clientVersion\":\"([^\"]*)\"")
 	findFirstContext = regexp.MustCompile("{\"responseContext\"")
 	// Bless, and curse jq
-	jsonFilter = jqMustCompile(`.. | select(type == "object") |
+	jsonFilter = jqMustCompile(`
+    def parse_text: [
+        (if (.runs | length > 0) then .runs[]  else {text: .simpleText} end) | {
+	        emoji: {id: .emoji.emojiId, name: .emoji.image.accessibility.accessibilityData.label, url: .emoji.image.thumbnails[0].url},
+	        text: .text,
+	    }
+    ];
+	.. | select(type == "object") |
 	if has("liveChatPaidMessageRenderer") then .liveChatPaidMessageRenderer + {type: "super"}
 	elif has("liveChatTextMessageRenderer") then .liveChatTextMessageRenderer + {type: "chat"}
 	elif has("liveChatMembershipItemRenderer") then .liveChatMembershipItemRenderer + {type: "member"}
+	elif has("liveChatSponsorshipsGiftPurchaseAnnouncementRenderer") then .liveChatSponsorshipsGiftPurchaseAnnouncementRenderer.header.liveChatSponsorshipsHeaderRenderer + {type: "member_gifter"}
+	elif has("liveChatSponsorshipsGiftRedemptionAnnouncementRenderer") then .liveChatSponsorshipsGiftRedemptionAnnouncementRenderer + {type: "member_giftee"}
 	else null end
 	| select ( . != null) |
 	{
 	    author: .authorName.simpleText, id, timestampUsec, type,
 	    badges:  (if (.authorBadges | length > 0) then [.authorBadges[] | .liveChatAuthorBadgeRenderer.accessibility.accessibilityData.label] else null end),
 	    amount: .purchaseAmountText.simpleText,
-	    message: [ (if (.message.runs | length > 0) then .message.runs[]  else .message.simpleText end) | {
-	        emoji: {id: .emoji.emojiId, name: .emoji.image.accessibility.accessibilityData.label, url: .emoji.image.thumbnails[0].url},
-	        text: .text,
-	    }],
-	    headerSubtext: [ (if (.headerSubtext.runs | length > 0) then .headerSubtext.runs[] else .headerSubtext.simpleText end) | {
-	        emoji: {id: .emoji.emojiId, name: .emoji.image.accessibility.accessibilityData.label, url: .emoji.image.thumbnails[0].url},
-	        text: .text,
-	    }]
+	    message: .message | parse_text,
+	    headerSubtext: .headerSubtext | parse_text,
+	    primaryText: .primaryText | parse_text,
 	}`)
 )
 
@@ -655,9 +663,10 @@ func (c *chat) extractAndSend(data map[string]interface{}) error {
 		}
 		ytMsg := ytMessage{}
 		if err := json.Unmarshal(enc, &ytMsg); err != nil {
-			return fmt.Errorf("Bad YT chat response: %v", err)
+			return fmt.Errorf("Bad YT chat parse: %v", err)
 		}
 		ytMsg.Process() // do some filtering: emoji passthrough, badge normalization
+
 		tags := irc.Tags{}
 		tags["time"] = irc.TagValue(formatTimeUsec(ytMsg.TimestampUsec))
 		tags["emotes"] = irc.TagValue(ytMsg.EmotesTag())
@@ -672,9 +681,28 @@ func (c *chat) extractAndSend(data map[string]interface{}) error {
 
 		ircCmd := "PRIVMSG"
 		ircAuthor := strings.ReplaceAll(strings.ReplaceAll(ytMsg.Author, " ", "_"), "!", "！")
-		ircMsg := ytMsg.String()
+		ircMsg := runToString(ytMsg.Messages)
 		if ytMsg.Type == "member" {
-			ircMsg = ircAuthor + " - " + ytMsg.SubHeadString() + ircMsg
+		    prim := runToString(ytMsg.PrimaryText)
+		    sub := runToString(ytMsg.SubHeader)
+            msg := coalesce(ircMsg, prim, sub)
+
+			svcMsg := "New Membership, "
+			if ircMsg != "" {
+                svcMsg = "Membership renewed, "
+		    }
+
+			ircMsg = svcMsg + ircAuthor + " - " + msg
+			ircAuthor = "services"
+			ircCmd = "NOTICE"
+		}
+		if ytMsg.Type == "member_gifter" {
+            ircMsg = ircAuthor + " " + runToString(ytMsg.PrimaryText)
+			ircAuthor = "services"
+			ircCmd = "NOTICE"
+		}
+		if ytMsg.Type == "member_giftee" {
+            ircMsg = ircAuthor + " " + ircMsg
 			ircAuthor = "services"
 			ircCmd = "NOTICE"
 		}
@@ -732,7 +760,9 @@ func (c *chat) readChat() error {
 		return fmt.Errorf("Bad YT chat response: %v", err)
 	}
 
-	c.extractAndSend(idata)
+	if err := c.extractAndSend(idata); err != nil {
+	    log.Printf("Error reading chat: %v", err)
+	}
 	return nil
 }
 
