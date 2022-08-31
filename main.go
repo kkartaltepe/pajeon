@@ -43,6 +43,13 @@ func formatTimeUsec(t string) string {
 	return time.UnixMicro(intVal).Format(ircTimeLayout)
 }
 
+func unformatTimeUsc(t string) time.Time {
+    if t, e := time.Parse(ircTimeLayout, t); e == nil {
+        return t
+    }
+    return time.Now().UTC()
+}
+
 func jqMustCompile(s string) *jq.Code {
 	q, err := jq.Parse(s)
 	if err != nil {
@@ -629,15 +636,7 @@ var (
 	}`)
 )
 
-func (c *chat) extractAndSend(data map[string]interface{}) error {
-	gotMessage := false
-	defer func() {
-		if gotMessage {
-			c.s.hasWork.Store(true)
-			c.s.hasWorkCond.Signal()
-		}
-	}()
-
+func (c *chat) extractAndSend(data map[string]interface{}, slowSend bool) error {
 	toSend := make([]*irc.Message, 0, 64)
 	iter := jsonFilter.Run(data)
 	for {
@@ -708,20 +707,39 @@ func (c *chat) extractAndSend(data map[string]interface{}) error {
 	}
 
 	c.lock.Lock()
+	defer c.lock.Unlock()
 	select {
 	case <-c.done:
 		return nil
 	default:
+	    if len(toSend) < 1 {
+	        return nil
+	    }
+	    if !slowSend {
+		    for _, m := range toSend {
+			    c.msgs <- m
+			}
+			c.s.hasWork.Store(true)
+			c.s.hasWorkCond.Signal()
+			return nil
+	    }
+	    base := unformatTimeUsc(string(toSend[0].Tags["time"]))
+	    baseNow := time.Now()
 		for _, m := range toSend {
-			gotMessage = true
+		    // drip feed at the right rate for the messages recieved
+		    delay := time.Until(baseNow.Add(unformatTimeUsc(string(m.Tags["time"])).Sub(base)))
+		    if delay > 0 {
+		        time.Sleep(delay)
+		    }
 			c.msgs <- m
+			c.s.hasWork.Store(true)
+			c.s.hasWorkCond.Signal()
 		}
 	}
-	c.lock.Unlock()
 	return nil
 }
 
-func (c *chat) readChat() error {
+func (c *chat) readChat(slowSend bool) error {
 	getLiveChatBody := fmt.Sprintf(`{"context": {"client":{"hl":"en","gl":"US","clientName":"WEB","clientVersion":"%s","platform":"DESKTOP"}},"continuation": "%s"}`, c.version, c.continuation)
 	req, err := http.NewRequest("POST", fmt.Sprintf("https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?key=%s&prettyPrint=false", c.apiKey), strings.NewReader(getLiveChatBody))
 	if err != nil {
@@ -752,7 +770,7 @@ func (c *chat) readChat() error {
 		return fmt.Errorf("Bad YT chat response: %v", err)
 	}
 
-	if err := c.extractAndSend(idata); err != nil {
+	if err := c.extractAndSend(idata, slowSend); err != nil {
 	    log.Printf("Error reading chat: %v", err)
 	}
 	return nil
@@ -817,7 +835,7 @@ func NewChat(id string, s *Server) (*chat, error) {
 	}
 
 	// Read the history and send it down.
-	if err := chat.readChat(); err != nil {
+	if err := chat.readChat(false); err != nil {
 		chat.Close()
 		return nil, fmt.Errorf("Chat closed due to an error: %v", err)
 	}
@@ -831,7 +849,7 @@ func NewChat(id string, s *Server) (*chat, error) {
 				log.Printf("Closing %s reader", chat.id)
 				return
 			case <-tick.C:
-				if err := chat.readChat(); err != nil {
+				if err := chat.readChat(true); err != nil {
 					s.commands <- &Cmd{kind: "CLOSECHAN", params: []string{chat.id}}
 					s.hasWork.Store(true)
 					s.hasWorkCond.Signal()
