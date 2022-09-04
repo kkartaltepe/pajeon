@@ -26,13 +26,13 @@ import (
 const ChatPollDuration = 2 * time.Second
 const ircTimeLayout = "2006-01-02T15:04:05.000Z"
 
-func coalesce(ss ...string) string {
+func coalesce(ss ...[]ytMessagePart) []ytMessagePart {
     for _, s := range ss {
-        if s != "" {
+        if len(s) > 0 {
             return s
         }
     }
-    return ""
+    return nil
 }
 
 func formatTimeUsec(t string) string {
@@ -491,9 +491,15 @@ func (m *ytMessage) Process() {
 }
 
 func runProcess(r []ytMessagePart) {
+	// drop empty messages and reduce size of the array.
+	drop := 0
 	for i, msg := range r {
 		if len(msg.Text) > 0 {
 			continue
+		}
+		if len(msg.Emote.Id) == 0 {
+		    drop += 1
+		    continue
 		}
 
 		// Emoji's are their own id and name so we can pick them out fairly
@@ -503,7 +509,12 @@ func runProcess(r []ytMessagePart) {
 			r[i].Text = msg.Emote.Name
 			r[i].Emote = ytEmoteInfo{}
 		}
+
+        if drop > 0 {
+            r[i-drop] = r[i]
+        }
 	}
+	r = r[0:len(r)-drop]
 }
 
 func runToString(r []ytMessagePart) string {
@@ -531,10 +542,10 @@ func utf16Len(s string) int {
 }
 
 // Emote lengths are in utf16 encoding because the web is fucking terrible, and we want to match twitch.tv/tags for now.
-func (m *ytMessage) EmotesTag() string {
+func EmotesTag(msgs []ytMessagePart) string {
 	pos := 0
 	emoPos := map[string][][]int32{}
-	for _, msg := range m.Messages {
+	for _, msg := range msgs {
 		if len(msg.Text) > 0 {
 			pos += utf16Len(msg.Text)
 		} else if msg.Emote.Id != "" { // TODO: Why are there empty messages when no message field is in the json
@@ -567,9 +578,9 @@ func (m *ytMessage) EmotesTag() string {
 	return tag
 }
 
-func (m *ytMessage) EmotesURLTag() string {
+func EmotesURLTag(msgs []ytMessagePart) string {
 	urls := map[string]string{}
-	for _, msg := range m.Messages {
+	for _, msg := range msgs {
 		if len(msg.Emote.Name) > 0 {
 			urls[msg.Emote.Name] = msg.Emote.URL
 		}
@@ -659,9 +670,6 @@ func (c *chat) extractAndSend(data map[string]interface{}, slowSend bool) error 
 		ytMsg.Process() // do some filtering: emoji passthrough, badge normalization
 
 		tags := irc.Tags{}
-		tags["time"] = irc.TagValue(formatTimeUsec(ytMsg.TimestampUsec))
-		tags["emotes"] = irc.TagValue(ytMsg.EmotesTag())
-		tags["emotes-url"] = irc.TagValue(ytMsg.EmotesURLTag())
 		if len(ytMsg.Amount) > 0 {
 			tags["amount"] = irc.TagValue(ytMsg.Amount)
 		}
@@ -672,36 +680,39 @@ func (c *chat) extractAndSend(data map[string]interface{}, slowSend bool) error 
 
 		ircCmd := "PRIVMSG"
 		ircAuthor := strings.ReplaceAll(strings.ReplaceAll(ytMsg.Author, " ", "_"), "!", "！")
-		ircMsg := runToString(ytMsg.Messages)
+		ircMsg := ytMsg.Messages // we are going to mutate this, but golang does give a fuck.
 		if ytMsg.Type == "member" {
-		    prim := runToString(ytMsg.PrimaryText)
-		    sub := runToString(ytMsg.SubHeader)
+		    prim := ytMsg.PrimaryText
+		    sub := ytMsg.SubHeader
             msg := coalesce(ircMsg, prim, sub)
 
 			svcMsg := "New Membership, "
-			if ircMsg != "" {
+			if len(ircMsg) == 0 {
                 svcMsg = "Membership renewed, "
 		    }
 
-			ircMsg = svcMsg + ircAuthor + " - " + msg
+			ircMsg = append([]ytMessagePart{{Text: svcMsg + ircAuthor + " - "}}, msg...)
 			ircAuthor = "services"
 			ircCmd = "NOTICE"
 		}
 		if ytMsg.Type == "member_gifter" {
-            ircMsg = ircAuthor + " " + runToString(ytMsg.PrimaryText)
+			ircMsg = append([]ytMessagePart{{Text: ircAuthor + " "}}, ytMsg.PrimaryText...)
 			ircAuthor = "services"
 			ircCmd = "NOTICE"
 		}
 		if ytMsg.Type == "member_giftee" {
-            ircMsg = ircAuthor + " " + ircMsg
+			ircMsg = append([]ytMessagePart{{Text: ircAuthor + " "}}, ytMsg.Messages...)
 			ircAuthor = "services"
 			ircCmd = "NOTICE"
 		}
 
+		tags["time"] = irc.TagValue(formatTimeUsec(ytMsg.TimestampUsec))
+		tags["emotes"] = irc.TagValue(EmotesTag(ircMsg))
+		tags["emotes-url"] = irc.TagValue(EmotesURLTag(ircMsg))
 		toSend = append(toSend, &irc.Message{
 			Prefix:  &irc.Prefix{Name: ircAuthor},
 			Command: ircCmd,
-			Params:  []string{c.id, ircMsg},
+			Params:  []string{c.id, runToString(ircMsg)},
 			Tags:    tags,
 		})
 	}
