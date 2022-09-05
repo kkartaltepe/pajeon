@@ -485,12 +485,12 @@ func (m *ytMessage) Process() {
 	for i, b := range m.Badges {
 		m.Badges[i] = strings.ToLower(strings.Split(b, " ")[0])
 	}
-	runProcess(m.Messages)
-	runProcess(m.SubHeader)
-	runProcess(m.PrimaryText)
+	m.Messages = runProcess(m.Messages)
+	m.SubHeader = runProcess(m.SubHeader)
+	m.PrimaryText = runProcess(m.PrimaryText)
 }
 
-func runProcess(r []ytMessagePart) {
+func runProcess(r []ytMessagePart) []ytMessagePart {
 	// drop empty messages and reduce size of the array.
 	drop := 0
 	for i, msg := range r {
@@ -514,7 +514,7 @@ func runProcess(r []ytMessagePart) {
             r[i-drop] = r[i]
         }
 	}
-	r = r[0:len(r)-drop]
+	return r[0:len(r)-drop]
 }
 
 func runToString(r []ytMessagePart) string {
@@ -687,7 +687,7 @@ func (c *chat) extractAndSend(data map[string]interface{}, slowSend bool) error 
             msg := coalesce(ircMsg, prim, sub)
 
 			svcMsg := "New Membership, "
-			if len(ircMsg) == 0 {
+			if len(ircMsg) != 0 {
                 svcMsg = "Membership renewed, "
 		    }
 
